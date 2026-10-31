@@ -1,0 +1,13 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment: { POSTGRES_DB: wagering, POSTGRES_USER: wager, POSTGRES_PASSWORD: wager }
+    ports: ["5433:5432"]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U wager -d wagering"], interval: 5s, timeout: 5s, retries: 20 }
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+  localstack:
+    image: localstack/localstack:3.8
+    environment: { SERVICES: sqs, AWS_DEFAULT_REGION: us-east-1, PERSISTENCE: 1 }
+    ports: ["4566:4566"]
+    volumes: ["localstack-data:/var/lib/localstack", "/var/run/docker.sock:/var/run/docker.sock"]
+volumes: { postgres-data: {}, localstack-data: {} }

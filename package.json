@@ -1,0 +1,18 @@
+{
+  "name": "jungle-distributed-wagering-processor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "bun": ">=1.1.0" },
+  "scripts": {
+    "dev": "bun --watch src/main.ts", "start": "bun src/main.ts", "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit", "test": "bun test", "test:integration": "bun test test/integration",
+    "db:migrate": "bun run build && bun x mikro-orm migration:up --config ./mikro-orm.config.js", "db:migrate:down": "bun run build && bun x mikro-orm migration:down --config ./mikro-orm.config.js", "sqs:setup": "bun scripts/setup-sqs.ts",
+    "compose:up": "docker compose up -d postgres localstack", "compose:down": "docker compose down", "compose:logs": "docker compose logs -f"
+  },
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3.900.0", "@mikro-orm/core": "^6.4.0", "@mikro-orm/migrations": "^6.4.0", "@mikro-orm/nestjs": "^6.1.0", "@mikro-orm/postgresql": "^6.4.0",
+    "@nestjs/common": "^11.1.0", "@nestjs/core": "^11.1.0", "@nestjs/platform-express": "^11.1.0", "class-transformer": "^0.5.1", "class-validator": "^0.14.2", "reflect-metadata": "^0.2.2", "rxjs": "^7.8.2"
+  },
+  "devDependencies": { "@mikro-orm/cli": "^6.6.17", "@types/bun": "latest", "@types/express": "^5.0.3", "ts-node": "^10.9.2", "typescript": "^5.9.0" }
+}
