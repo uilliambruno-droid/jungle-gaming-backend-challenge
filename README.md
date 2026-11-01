@@ -92,15 +92,9 @@ $env:RUN_INTEGRATION = "1"
 bun test
 ```
 
-A suíte de concorrência também inicia múltiplas instâncias locais. Para exercitar o fault injection opcional de crash depois do commit e antes do ack, inicie a API com `SQS_TEST_FAIL_AFTER_COMMIT_BEFORE_ACK=1` e `SQS_VISIBILITY_TIMEOUT_SECONDS=2`, então execute:
+A suíte de concorrência também inicia múltiplas instâncias locais. Para exercitar o fault injection opcional de crash depois do commit e antes do ack, siga a execução isolada em dois terminais descrita em [RETRY_DLQ_ARCHITECTURE.md](./RETRY_DLQ_ARCHITECTURE.md). Rodar somente o teste específico garante que a falha única afete a mensagem correta.
 
-```powershell
-$env:RUN_INTEGRATION = "1"
-$env:EXPECT_ACK_FAULT = "1"
-bun test test/integration
-```
-
-Validação desta revisão: instalação congelada em checkout temporário limpo com Bun 1.4.4; typecheck e build passaram; suíte completa contra PostgreSQL 16 e LocalStack 3.8: 30 testes aprovados, 1 teste opcional de fault injection ignorado (`EXPECT_ACK_FAULT=1`) e nenhuma falha.
+Validação mais recente (01/11/2026): com Bun 1.4.4, PostgreSQL 16 e LocalStack 3.8 ativos, migrations/setup SQS, `bun run typecheck`, `bun run build`, `bun test` (11 aprovados; 22 integrações ignoradas por ausência de `RUN_INTEGRATION`) e `$env:RUN_INTEGRATION="1"; bun test` (30 aprovados, 1 fault injection ignorada, 0 falhas) passaram. A fault injection também foi executada separadamente e passou: `1 pass, 8 filtered out, 0 fail`. Procedimento exato em [RETRY_DLQ_ARCHITECTURE.md](./RETRY_DLQ_ARCHITECTURE.md).
 
 ## Operação e arquitetura
 
@@ -114,6 +108,6 @@ docker compose down
 
 O serviço atende `SIGTERM` e `SIGINT` com shutdown gracioso. Wallet, transação, ledger, Inbox e Outbox são persistidos atomicamente; o publisher publica os envelopes tipados após commit. Consulte [ARCHITECTURE.md](./ARCHITECTURE.md) para locks, idempotência, contratos de erro, eventos, métricas e trade-offs; veja [RETRY_DLQ_ARCHITECTURE.md](./RETRY_DLQ_ARCHITECTURE.md) para retries e DLQ.
 
-As migrations protegem a consistência wallet/ledger também no banco: uma constraint trigger diferida compara o saldo materializado à soma do ledger no commit. `ProviderIdentityPort` é o ponto de extensão para integrar um IdP OIDC no limite HTTP; autenticação não está ativa neste challenge. A proposta e os limites de confiança estão em [ARCHITECTURE.md](./ARCHITECTURE.md).
+As migrations protegem a consistência wallet/ledger também no banco: uma constraint trigger diferida compara o saldo materializado à soma do ledger no commit. `ProviderIdentityPort` existe como interface de extensão para futura autenticação OIDC no limite HTTP; não tem implementação nem está conectada aos controllers, então autenticação não está ativa neste challenge. A proposta e os limites de confiança estão em [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 Limitações conhecidas: métricas são mantidas em memória e não há autenticação externa. Eventos da Outbox podem ser publicados mais de uma vez; consumidores devem deduplicar persistentemente por `eventId`. Não registre valores ou payloads financeiros em logs.

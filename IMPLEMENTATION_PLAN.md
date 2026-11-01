@@ -53,7 +53,7 @@ Ambiente: Bun 1.4.4, PostgreSQL 16 e LocalStack 3.8. Migration 003 aplicada sem 
 
 Cobertura: 50 redeliveries em três workers, disputa de saldo em duas instâncias, três instâncias e wallets distintas, reversões pendentes concorrentes, replay do saldo original, Outbox concorrente, DLQ, reinício após commit e reconciliação com o ledger.
 
-Resultado final anterior: typecheck/build sem erros; suíte completa com 26 testes aprovados e 1 teste opcional de fault injection ignorado.
+Resultado histórico anterior: typecheck/build sem erros; suíte completa com 26 testes aprovados e 1 teste opcional de fault injection ignorado. Este resultado pertence à revisão anterior e não é a validação atual.
 
 ## 7. Revisão adicional e correções — concluído
 
@@ -73,7 +73,7 @@ Resultado final anterior: typecheck/build sem erros; suíte completa com 26 test
 
 ### Resultado de validação desta revisão
 
-`bun run typecheck`, `bun run build` e `RUN_INTEGRATION=1 bun test` passaram no checkout temporário. Resultado: **30 testes aprovados, 1 teste opcional ignorado, 0 falhas**. O teste ignorado valida fault injection commit-before-ack e requer iniciar a API com `SQS_TEST_FAIL_AFTER_COMMIT_BEFORE_ACK=1` e `EXPECT_ACK_FAULT=1`.
+Validação histórica da revisão anterior: `bun run typecheck`, `bun run build` e `RUN_INTEGRATION=1 bun test` passaram no checkout temporário. Resultado: **30 testes aprovados, 1 teste opcional ignorado, 0 falhas**. O teste ignorado valida fault injection commit-before-ack; o resultado histórico não afirma que essa falha foi injetada com sucesso.
 
 ### Reavaliação estimada pela seção 14
 
@@ -90,3 +90,28 @@ Estimativa técnica, não nota oficial:
 | Observabilidade | 4/5 | logs, métricas e health presentes; métricas em memória, sem percentis, e DLQ aproximada. |
 | Documentação | 5/5 | setup, contrato, locks, replay, OIDC futuro, Outbox, limitações e plano registrados. |
 | **Total estimado** | **94/100** | **Sem falha eliminatória identificada nesta revisão.** |
+
+## 8. Alinhamento documental e validação final
+
+### Correções documentais
+
+- [x] `ProviderIdentityPort` existe como interface, mas não possui implementação nem integração nos controllers; documentado sem sugerir que autenticação esteja ativa.
+- [x] Documentada a sequência real do worker: selecionar candidato sem lock, bloquear wallet, reler/bloquear a transação pendente e revalidar status/vencimento antes de processar.
+- [x] Marcados explicitamente como históricos os resultados anteriores de 26 e 30 testes para não confundi-los com a validação atual.
+- [x] Documentada a execução isolada da fault injection em dois terminais; usar filtro de nome evita que a falha única atinja outra mensagem primeiro.
+
+### Validação atual observada — 01/11/2026
+
+Ambiente local: Bun 1.4.4, Docker Compose com PostgreSQL 16 e LocalStack 3.8 saudáveis.
+
+| Comando | Resultado |
+|---|---|
+| `bun run db:migrate` | Sucesso; schema já estava na migration mais recente. |
+| `bun run sqs:setup` | Sucesso; três filas esperadas resolvidas no LocalStack. |
+| `bun run typecheck` | Sucesso. |
+| `bun run build` | Sucesso. |
+| `bun test` | Sucesso: 11 testes passaram, 22 testes de integração foram ignorados porque `RUN_INTEGRATION` não estava habilitado. |
+| `$env:RUN_INTEGRATION="1"; bun test` | Sucesso: 30 passaram, 1 teste opcional de fault injection foi ignorado, 0 falharam. |
+| Teste filtrado commit-before-ack com `EXPECT_ACK_FAULT=1` e API iniciada com `SQS_TEST_FAIL_AFTER_COMMIT_BEFORE_ACK=1`, `SQS_VISIBILITY_TIMEOUT_SECONDS=2` | Sucesso: 1 passou, 8 filtrados, 0 falharam. |
+
+O teste opcional foi executado isoladamente depois da suíte completa, reiniciando a API com a fault injection habilitada, para garantir que a falha de uso único atingisse a mensagem do cenário. Instruções reproduzíveis em `RETRY_DLQ_ARCHITECTURE.md`.
