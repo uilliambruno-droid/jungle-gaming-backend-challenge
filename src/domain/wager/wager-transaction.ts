@@ -39,5 +39,5 @@ export class WagerTransaction {
   reject(code:FailureCode){this.assertOpen(); this.state.status=WagerTransactionStatus.Rejected; this.state.failureCode=code}
   fail(code:FailureCode){this.assertOpen(); this.state.status=WagerTransactionStatus.Failed; this.state.failureCode=code}
   private assertOpen(){if(this.isTerminal()) throw new Error("INVALID_TRANSACTION_STATE")}
-  toState():WagerState{return {...this.state}}
+  toState():WagerState{return {...this.state,createdAt:new Date(this.state.createdAt),processedAt:this.state.processedAt?new Date(this.state.processedAt):undefined}}
 }

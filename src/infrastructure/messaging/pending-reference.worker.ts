@@ -131,18 +131,46 @@ export class PendingReferenceWorker implements OnModuleInit, OnModuleDestroy {
   private async processOne(): Promise<boolean> {
     const startedAt = performance.now();
     const didProcess = await this.em.transactional(async tm => {
+      const candidates = await tm.execute<Array<{ id: string; wallet_id: string }>>(
+        `SELECT id,wallet_id
+         FROM wager_transactions
+         WHERE status='PENDING_REFERENCE'
+           AND (reference_next_attempt_at IS NULL OR reference_next_attempt_at<=now())
+         ORDER BY created_at,id
+         LIMIT 1`,
+      );
+      if (!candidates.length) return false;
+
+      const walletRows = await tm.execute<WalletRow[]>(
+        "SELECT id,player_id,balance,currency,version,created_at,updated_at FROM wallets WHERE id=? FOR UPDATE",
+        [candidates[0].wallet_id],
+      );
+      if (!walletRows.length) throw new Error("PENDING_REFERENCE_WALLET_MISSING");
+      const walletRow = walletRows[0];
+      const wallet = Wallet.rehydrate({
+        id: walletRow.id,
+        playerId: walletRow.player_id,
+        balance: Money.from({
+          amount: normalizeAmount(walletRow.balance),
+          currency: walletRow.currency.trim(),
+        }),
+        version: walletRow.version,
+        createdAt: walletRow.created_at,
+        updatedAt: walletRow.updated_at,
+      });
+
       const rows = await tm.execute<PendingRow[]>(
         `SELECT id,provider_id,external_transaction_id,idempotency_key,payload_hash,
                 reference_external_transaction_id,wallet_id,player_id,round_id,game_id,amount,currency,kind,
                 reference_attempts,correlation_id,causation_id,created_at,processed_at,reference_transaction_id,failure_code
          FROM wager_transactions
-         WHERE status='PENDING_REFERENCE'
+         WHERE id=?
+           AND status='PENDING_REFERENCE'
            AND (reference_next_attempt_at IS NULL OR reference_next_attempt_at<=now())
-         ORDER BY created_at,id
-         FOR UPDATE SKIP LOCKED
-         LIMIT 1`,
+         FOR UPDATE`,
+        [candidates[0].id],
       );
-      if (!rows.length) return false;
+      if (!rows.length) return true;
       const row = rows[0];
       const context: EventContext = {
         correlationId: row.correlation_id,
@@ -203,24 +231,6 @@ export class PendingReferenceWorker implements OnModuleInit, OnModuleDestroy {
           failureCode: code,
         }));
       };
-
-      const walletRows = await tm.execute<WalletRow[]>(
-        "SELECT id,player_id,balance,currency,version,created_at,updated_at FROM wallets WHERE id=? FOR UPDATE",
-        [row.wallet_id],
-      );
-      if (!walletRows.length) throw new Error("PENDING_REFERENCE_WALLET_MISSING");
-      const walletRow = walletRows[0];
-      const wallet = Wallet.rehydrate({
-        id: walletRow.id,
-        playerId: walletRow.player_id,
-        balance: Money.from({
-          amount: normalizeAmount(walletRow.balance),
-          currency: walletRow.currency.trim(),
-        }),
-        version: walletRow.version,
-        createdAt: walletRow.created_at,
-        updatedAt: walletRow.updated_at,
-      });
 
       const references = await tm.execute<ReferenceRow[]>(
         `SELECT id,provider_id,external_transaction_id,idempotency_key,payload_hash,wallet_id,player_id,round_id,

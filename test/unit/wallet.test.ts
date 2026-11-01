@@ -18,4 +18,22 @@ describe("Wallet and ledger", () => {
     expect(wallet.balance.toString()).toBe("10.00");
     expect(wallet.version).toBe(1);
   });
+
+  test("does not expose mutable date references", () => {
+    const createdAt = new Date(0);
+    const wallet = Wallet.open({ id: "w-date", playerId: "p-date", initialBalance: money("1.00"), now: createdAt });
+    createdAt.setTime(10);
+    const exposedCreatedAt = wallet.createdAt;
+    exposedCreatedAt.setTime(20);
+    expect(wallet.createdAt.getTime()).toBe(0);
+
+    const entry = wallet.credit(money("1.00"), {
+      id: "l-date",
+      transactionId: "t-date",
+      at: new Date(30),
+    });
+    const exposedEntryDate = entry.createdAt;
+    exposedEntryDate.setTime(40);
+    expect(entry.createdAt.getTime()).toBe(30);
+  });
 });

@@ -53,4 +53,40 @@ Ambiente: Bun 1.4.4, PostgreSQL 16 e LocalStack 3.8. Migration 003 aplicada sem 
 
 Cobertura: 50 redeliveries em três workers, disputa de saldo em duas instâncias, três instâncias e wallets distintas, reversões pendentes concorrentes, replay do saldo original, Outbox concorrente, DLQ, reinício após commit e reconciliação com o ledger.
 
-Resultado final: typecheck/build sem erros; suíte completa com 26 testes aprovados, 1 teste opcional de fault injection ignorado (requer `EXPECT_ACK_FAULT=1`) e nenhuma falha.
+Resultado final anterior: typecheck/build sem erros; suíte completa com 26 testes aprovados e 1 teste opcional de fault injection ignorado.
+
+## 7. Revisão adicional e correções — concluído
+
+### Prioridade alta
+
+- [x] Fronteira monetária: adaptadores de dinheiro recebem apenas strings decimais; domínio continua usando `bigint`. Conversões numéricas restantes são de configuração, paginação ou métricas, nunca de dinheiro.
+- [x] Ordem dos locks: API e worker agora bloqueiam wallet antes de transação de referência/pendente. O worker escolhe um candidato sem lock, bloqueia a wallet e então relê/valida o candidato sob `FOR UPDATE`.
+- [x] Replay pendente: contrato definido e testado. Uma repetição retorna a resposta inicial armazenada (`202`, `PENDING_REFERENCE` e saldo original), mesmo após processamento assíncrono; `GET /wagering/transactions/:id` informa o estado atual.
+- [x] Autenticação futura: documentado OIDC e criado `ProviderIdentityPort` como extensão no limite HTTP. Autenticação não é ativada neste challenge nem vale pontos; não confiar em `providerId` não autenticado em produção.
+
+### Prioridade média
+
+- [x] Consistência no banco: migration 004 adiciona constraint triggers diferidas para exigir saldo da wallet igual à soma assinada do ledger e moeda consistente no commit. A suíte comprova rejeição de divergência. O teste de reconciliação injeta corrupção com `session_replication_role=replica` para simular legado/falha fora do fluxo normal.
+- [x] Outbox: documentada publicação at-least-once, janela crash entre publish e marcar como enviado, deduplicação FIFO limitada à janela do SQS e necessidade de deduplicação persistente por `eventId` no consumidor.
+- [x] Datas do domínio: getters e snapshots agora devolvem cópias defensivas; testes verificam que mutações externas não alteram estado interno.
+- [x] Clone limpo: dependências foram instaladas com `bun install --frozen-lockfile` em checkout temporário isolado; migrations/setup SQS, typecheck, build e suíte completa foram executados com PostgreSQL 16 e LocalStack 3.8.
+
+### Resultado de validação desta revisão
+
+`bun run typecheck`, `bun run build` e `RUN_INTEGRATION=1 bun test` passaram no checkout temporário. Resultado: **30 testes aprovados, 1 teste opcional ignorado, 0 falhas**. O teste ignorado valida fault injection commit-before-ack e requer iniciar a API com `SQS_TEST_FAIL_AFTER_COMMIT_BEFORE_ACK=1` e `EXPECT_ACK_FAULT=1`.
+
+### Reavaliação estimada pela seção 14
+
+Estimativa técnica, não nota oficial:
+
+| Critério | Pontos | Evidências e ressalvas |
+|---|---:|---|
+| Correção financeira | 20/20 | `bigint`, ledger, reversões, replay e trigger de consistência no banco; integração real e reconciliação assinada. |
+| Concorrência | 18/20 | múltiplas instâncias, wallets distintas, hot wallet e disputa HTTP/worker testadas; ainda há custo/espera em wallet muito concorrida. |
+| Idempotência | 15/15 | unicidade persistente, hash de payload, snapshots originais e replay pendente testados. |
+| Mensageria e falhas | 14/15 | Inbox/Outbox, retries, DLQ, restart e shutdown; fault injection específico permanece opt-in. |
+| Modelagem e arquitetura | 9/10 | domínio encapsulado, boundaries e port de identidade; autenticação externa é uma extensão documentada, não implementada. |
+| Testes | 9/10 | PostgreSQL/SQS reais, race tests e checkout limpo; 1 cenário de fault injection foi ignorado nesta execução. |
+| Observabilidade | 4/5 | logs, métricas e health presentes; métricas em memória, sem percentis, e DLQ aproximada. |
+| Documentação | 5/5 | setup, contrato, locks, replay, OIDC futuro, Outbox, limitações e plano registrados. |
+| **Total estimado** | **94/100** | **Sem falha eliminatória identificada nesta revisão.** |

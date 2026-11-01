@@ -120,6 +120,7 @@ integration("financial concurrency and persistence", () => {
   async function startInstance(queueName: string, options: {
     consumerName: string;
     failAfterCommit?: boolean;
+    pendingPollIntervalMs?: number;
   }): Promise<{ process: ReturnType<typeof Bun.spawn>; url: string }> {
     const port = await unusedPort();
     const child = Bun.spawn(["bun", "src/main.ts"], {
@@ -131,6 +132,9 @@ integration("financial concurrency and persistence", () => {
         SQS_VISIBILITY_TIMEOUT_SECONDS: "2",
         CONSUMER_NAME: options.consumerName,
         SQS_TEST_FAIL_AFTER_COMMIT_BEFORE_ACK: options.failAfterCommit ? "1" : "0",
+        ...(options.pendingPollIntervalMs
+          ? { PENDING_REFERENCE_POLL_INTERVAL_MS: String(options.pendingPollIntervalMs) }
+          : {}),
       },
       stdout: "ignore",
       stderr: "inherit",
@@ -213,6 +217,7 @@ integration("financial concurrency and persistence", () => {
       "Migration202610310001",
       "Migration202610310002",
       "Migration202611010003",
+      "Migration202611010004",
     ]);
 
     const constraints = await query<{ conname: string }>(
@@ -234,6 +239,13 @@ integration("financial concurrency and persistence", () => {
        WHERE tgrelid = 'wallet_ledger_entries'::regclass AND NOT tgisinternal`,
     );
     expect(triggers.map(row => row.tgname)).toContain("wallet_ledger_immutable");
+    const consistencyTriggers = await query<{ tgname: string }>(
+      `SELECT tgname FROM pg_trigger
+       WHERE tgrelid IN ('wallets'::regclass, 'wallet_ledger_entries'::regclass)
+         AND NOT tgisinternal`,
+    );
+    expect(consistencyTriggers.map(row => row.tgname)).toContain("wallet_ledger_consistency_on_wallet");
+    expect(consistencyTriggers.map(row => row.tgname)).toContain("wallet_ledger_consistency_on_entry");
 
     const wallet = await createWallet(apiUrl);
     const ledger = await query<{ id: string }>(
@@ -270,8 +282,211 @@ integration("financial concurrency and persistence", () => {
       await execute("RELEASE SAVEPOINT ledger_immutability_probe");
     });
 
+    let walletLedgerMismatchRejected = false;
+    try {
+      await orm.em.transactional(async transactionalEm => {
+        await transactionalEm.getConnection().execute(
+          "UPDATE wallets SET balance=balance+1 WHERE id=?",
+          [wallet.id],
+          "all",
+          transactionalEm.getTransactionContext(),
+        );
+        await transactionalEm.getConnection().execute(
+          "SET CONSTRAINTS ALL IMMEDIATE",
+          [],
+          "all",
+          transactionalEm.getTransactionContext(),
+        );
+      });
+    } catch {
+      walletLedgerMismatchRejected = true;
+    }
+    expect(walletLedgerMismatchRejected).toBe(true);
+
     await assertLedgerMatchesWallet(wallet.id, "100.00");
   }, 15_000);
+
+  test("replaying a pending reference returns its original response after async completion", async () => {
+    const suffix = crypto.randomUUID();
+    const queueName = `integration-pending-replay-${suffix}.fifo`;
+    const queueUrl = await createQueue(queueName);
+    const instance = await startInstance(queueName, {
+      consumerName: `integration-pending-replay-${suffix}`,
+      pendingPollIntervalMs: 20,
+    });
+    try {
+      const wallet = await createWallet(instance.url);
+      const betKey = `integration-pending-replay-bet-${suffix}`;
+      const refundKey = `integration-pending-replay-refund-${suffix}`;
+      const refundBody = {
+        providerId: "integration-concurrency-provider",
+        externalTransactionId: `external-${refundKey}`,
+        playerId: wallet.playerId,
+        walletId: wallet.id,
+        roundId: "integration-concurrency-round",
+        gameId: "integration-concurrency-game",
+        kind: "REFUND",
+        money: { amount: "25.00", currency: "BRL" },
+        referenceExternalTransactionId: `external-${betKey}`,
+      };
+
+      const initialResponse = await fetch(`${instance.url}/wagering/transactions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "idempotency-key": refundKey },
+        body: JSON.stringify(refundBody),
+      });
+      expect(initialResponse.status).toBe(202);
+      const initialResult = await initialResponse.json() as WagerResponse;
+      expect(initialResult.status).toBe("PENDING_REFERENCE");
+      expect(initialResult.balance?.amount).toBe("100.00");
+
+      const betResult = await submitBet(instance.url, wallet, "25.00", betKey);
+      expect(betResult.status).toBe("PROCESSED");
+      await waitUntil(async () => {
+        const rows = await query<{ status: string }>(
+          "SELECT status FROM wager_transactions WHERE idempotency_key=?",
+          [refundKey],
+        );
+        return rows[0]?.status === "PROCESSED";
+      }, 20_000, "PENDING_REFUND_WAS_NOT_PROCESSED");
+
+      const laterBet = await submitBet(instance.url, wallet, "10.00", `integration-pending-replay-later-${suffix}`);
+      expect(laterBet.balance?.amount).toBe("90.00");
+
+      const replayResponse = await fetch(`${instance.url}/wagering/transactions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "idempotency-key": refundKey },
+        body: JSON.stringify(refundBody),
+      });
+      expect(replayResponse.status).toBe(202);
+      const replay = await replayResponse.json() as WagerResponse;
+      expect(replay).toMatchObject({
+        transactionId: initialResult.transactionId,
+        status: "PENDING_REFERENCE",
+        idempotentReplay: true,
+        balance: { amount: "100.00", currency: "BRL" },
+      });
+      await assertLedgerMatchesWallet(wallet.id, "90.00", instance.url);
+    } finally {
+      await stopInstance(instance);
+      await deleteQueue(queueUrl);
+    }
+  }, 45_000);
+
+  test("HTTP reference lookup and pending worker use wallet-first locking", async () => {
+    const suffix = crypto.randomUUID();
+    const queueName = `integration-http-worker-locks-${suffix}.fifo`;
+    const queueUrl = await createQueue(queueName);
+    const instance = await startInstance(queueName, {
+      consumerName: `integration-http-worker-locks-${suffix}`,
+      pendingPollIntervalMs: 20,
+    });
+    let releaseWalletLock: (() => void) | undefined;
+    let walletLockAcquired: (() => void) | undefined;
+    const acquired = new Promise<void>(resolve => { walletLockAcquired = resolve; });
+    try {
+      const wallet = await createWallet(instance.url);
+      const pendingKey = `integration-http-worker-pending-${suffix}`;
+      const pendingBody = {
+        providerId: "integration-concurrency-provider",
+        externalTransactionId: `external-${pendingKey}`,
+        playerId: wallet.playerId,
+        walletId: wallet.id,
+        roundId: "integration-concurrency-round",
+        gameId: "integration-concurrency-game",
+        kind: "REFUND",
+        money: { amount: "25.00", currency: "BRL" },
+        referenceExternalTransactionId: `missing-reference-${suffix}`,
+      };
+      const pendingResponse = await fetch(`${instance.url}/wagering/transactions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "idempotency-key": pendingKey },
+        body: JSON.stringify(pendingBody),
+      });
+      expect(pendingResponse.status).toBe(202);
+      const pending = await pendingResponse.json() as WagerResponse;
+      await waitUntil(async () => {
+        const rows = await query<{ reference_attempts: number }>(
+          "SELECT reference_attempts FROM wager_transactions WHERE idempotency_key=?",
+          [pendingKey],
+        );
+        return (rows[0]?.reference_attempts ?? 0) >= 1;
+      }, 10_000, "PENDING_REFERENCE_WORKER_DID_NOT_START");
+
+      const blocker = orm.em.transactional(async transactionalEm => {
+        await transactionalEm.getConnection().execute(
+          "SELECT id FROM wallets WHERE id=? FOR UPDATE",
+          [wallet.id],
+          "all",
+          transactionalEm.getTransactionContext(),
+        );
+        await new Promise<void>(resolve => {
+          releaseWalletLock = resolve;
+          walletLockAcquired?.();
+        });
+      });
+      await acquired;
+
+      const rollbackBody = {
+        ...pendingBody,
+        externalTransactionId: `external-${pendingKey}-rollback`,
+        kind: "ROLLBACK",
+        referenceExternalTransactionId: pendingBody.externalTransactionId,
+      };
+      const rollbackResponsePromise = fetch(`${instance.url}/wagering/transactions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "idempotency-key": `integration-http-worker-rollback-${suffix}`,
+        },
+        body: JSON.stringify(rollbackBody),
+      });
+      await waitUntil(async () => {
+        const rows = await query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM pg_stat_activity
+           WHERE wait_event_type='Lock' AND query LIKE '%FROM wallets WHERE id%'`,
+        );
+        return Number(rows[0]?.count ?? 0) >= 1;
+      }, 10_000, "HTTP_REQUEST_DID_NOT_WAIT_ON_WALLET_LOCK");
+      await waitUntil(async () => {
+        const rows = await query<{ due: boolean }>(
+          `SELECT reference_next_attempt_at<=now() AS due
+           FROM wager_transactions WHERE idempotency_key=?`,
+          [pendingKey],
+        );
+        return rows[0]?.due === true;
+      }, 15_000, "PENDING_REFERENCE_DID_NOT_BECOME_DUE");
+      await waitUntil(async () => {
+        const rows = await query<{ count: string }>(
+          `SELECT count(*)::text AS count FROM pg_stat_activity
+           WHERE wait_event_type='Lock' AND query LIKE '%FROM wallets WHERE id%'`,
+        );
+        return Number(rows[0]?.count ?? 0) >= 2;
+      }, 10_000, "WORKER_DID_NOT_CONTEND_FOR_WALLET_LOCK");
+
+      const unlockWallet = releaseWalletLock;
+      if (!unlockWallet) throw new Error("WALLET_LOCK_RELEASE_NOT_READY");
+      unlockWallet();
+      await blocker;
+      const rollbackResponse = await rollbackResponsePromise;
+      expect(rollbackResponse.status).toBe(422);
+      expect(await rollbackResponse.json()).toMatchObject({
+        failureCode: "INVALID_REFERENCE",
+      });
+      await waitUntil(async () => {
+        const rows = await query<{ reference_attempts: number }>(
+          "SELECT reference_attempts FROM wager_transactions WHERE idempotency_key=?",
+          [pendingKey],
+        );
+        return (rows[0]?.reference_attempts ?? 0) >= 2;
+      }, 10_000, "PENDING_REFERENCE_WORKER_DID_NOT_RESUME");
+      await assertLedgerMatchesWallet(wallet.id, "100.00", instance.url);
+    } finally {
+      releaseWalletLock?.();
+      await stopInstance(instance);
+      await deleteQueue(queueUrl);
+    }
+  }, 45_000);
 
   test("50 simultaneous deliveries of one message make exactly one financial effect", async () => {
     const suffix = crypto.randomUUID();
@@ -562,7 +777,12 @@ integration("financial concurrency and persistence", () => {
 
   test("reconciliation reports a real signed difference without changing the wallet", async () => {
     const wallet = await createWallet(apiUrl, "10.00");
-    await orm.em.getConnection().execute("UPDATE wallets SET balance=? WHERE id=?", ["8.00", wallet.id]);
+    await orm.em.transactional(async transactionalEm => {
+      const connection = transactionalEm.getConnection();
+      const context = transactionalEm.getTransactionContext();
+      await connection.execute("SET LOCAL session_replication_role = replica", [], "all", context);
+      await connection.execute("UPDATE wallets SET balance=? WHERE id=?", ["8.00", wallet.id], "all", context);
+    });
     try {
       const response = await fetch(`${apiUrl}/wallets/${wallet.id}/reconciliation`, { method: "POST" });
       expect(response.status).toBe(200);

@@ -120,12 +120,12 @@ function postgresErrorDetails(error: unknown): PostgresErrorDetails {
   return {};
 }
 
-function normalizeAmount(value: string | number): string {
+function normalizeAmount(value: string): string {
   const amount = String(value).trim();
   return amount.includes(".") ? amount : `${amount}.00`;
 }
 
-function moneyProps(amount: string | number, currency: string): MoneyProps {
+function moneyProps(amount: string, currency: string): MoneyProps {
   return Money.from({ amount: normalizeAmount(amount), currency: currency.trim() }).toJSON();
 }
 

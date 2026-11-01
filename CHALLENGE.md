@@ -759,7 +759,7 @@ Se a aplicação iniciar antes do banco, aguarde o healthcheck e repita `bun run
 
 Para validar a recuperação entre commit e ack, inicie a API com `SQS_TEST_FAIL_AFTER_COMMIT_BEFORE_ACK=1` e `SQS_VISIBILITY_TIMEOUT_SECONDS=2`, depois execute `$env:RUN_INTEGRATION="1"; $env:EXPECT_ACK_FAULT="1"; bun test test/integration`. A fault injection falha somente uma vez e é exclusiva para desenvolvimento/testes.
 
-Validação final executada em 01/11/2026 com PostgreSQL 16 e LocalStack 3.8 em um projeto Compose isolado com volumes novos: `bun install --dry-run --frozen-lockfile`, `bun run db:migrate`, `bun run sqs:setup`, `bun run typecheck`, `bun run build` e `$env:RUN_INTEGRATION="1"; bun test` concluíram com sucesso. Resultado: 20 testes aprovados, 1 teste legado opcional ignorado (flag `EXPECT_ACK_FAULT`) e 0 falhas. Os testes de reinicialização após commit-before-ack e de persistência de referências pendentes são executados pela suíte principal, sem essa flag.
+Validação desta revisão executada em 01/11/2026 com PostgreSQL 16 e LocalStack 3.8 em checkout temporário limpo: `bun install --frozen-lockfile`, `bun run db:migrate`, `bun run sqs:setup`, `bun run typecheck`, `bun run build` e `$env:RUN_INTEGRATION="1"; bun test` concluíram com sucesso. Resultado: 30 testes aprovados, 1 teste opcional de fault injection ignorado (flag `EXPECT_ACK_FAULT`) e 0 falhas. Os testes de reinicialização após commit-before-ack e de persistência de referências pendentes são executados pela suíte principal, sem essa flag.
 
 ### Diferenciais opcionais
 

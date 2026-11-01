@@ -21,8 +21,12 @@ export class WalletLedgerEntry {
     public readonly money: Money,
     public readonly balanceBefore: Money,
     public readonly balanceAfter: Money,
-    public readonly createdAt: Date,
-  ) {}
+    private readonly _createdAt: Date,
+  ) {
+    this._createdAt = new Date(_createdAt);
+  }
+
+  get createdAt(): Date { return new Date(this._createdAt); }
 
   static create(props: CreateLedgerEntryProps): WalletLedgerEntry {
     if (!props.money.isPositive()) throw new Error("LEDGER_AMOUNT_MUST_BE_POSITIVE");

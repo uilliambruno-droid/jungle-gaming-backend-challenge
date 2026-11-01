@@ -12,4 +12,12 @@ describe("WagerTransaction",()=>{const money=Money.from({amount:"10.00",currency
   const win=WagerTransaction.rehydrate({...base,kind:WagerTransactionKind.Win,status:WagerTransactionStatus.Processed,createdAt:new Date(0)});
   expect(rollback.ledgerDirectionFor(win)).toBe(LedgerDirection.Debit);
  });
+ test("does not expose mutable date references through state snapshots",()=>{
+  const createdAt=new Date(0);
+  const tx=WagerTransaction.rehydrate({...base,status:WagerTransactionStatus.Pending,createdAt});
+  createdAt.setTime(1);
+  const state=tx.toState();
+  state.createdAt.setTime(2);
+  expect(tx.createdAt.getTime()).toBe(0);
+ });
 });

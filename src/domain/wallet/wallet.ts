@@ -17,9 +17,12 @@ export class Wallet {
     public readonly currency: string,
     private _balance: Money,
     private _version: number,
-    public readonly createdAt: Date,
+    private _createdAt: Date,
     private _updatedAt: Date,
-  ) {}
+  ) {
+    this._createdAt = new Date(_createdAt);
+    this._updatedAt = new Date(_updatedAt);
+  }
 
   static open(props: { id: string; playerId: string; initialBalance: Money; now?: Date }): Wallet {
     if (props.initialBalance.isNegative()) throw new Error("INITIAL_BALANCE_CANNOT_BE_NEGATIVE");
@@ -35,6 +38,7 @@ export class Wallet {
 
   get balance(): Money { return this._balance; }
   get version(): number { return this._version; }
+  get createdAt(): Date { return new Date(this._createdAt); }
   get updatedAt(): Date { return new Date(this._updatedAt); }
 
   debit(amount: Money, entry: { id: string; transactionId: string; at: Date }): WalletLedgerEntry {

@@ -73,6 +73,8 @@ Envie `Idempotency-Key: provider-a:transaction-123`. Opcionalmente, envie `X-Cor
 
 Uma reversão duplicada rejeitada pela regra de negócio retorna `422` com `failureCode: "DUPLICATE_REVERSAL"`.
 
+O replay sempre preserva a resposta da primeira submissão. Se a resposta inicial foi `202 PENDING_REFERENCE`, repeti-la continua retornando o mesmo `202` e o mesmo saldo original, ainda que o worker já tenha concluído a operação. Consulte `GET /wagering/transactions/:id` para conhecer o estado atual.
+
 ## Validação
 
 Validações locais:
@@ -98,7 +100,7 @@ $env:EXPECT_ACK_FAULT = "1"
 bun test test/integration
 ```
 
-Resultados mais recentes: typecheck/build concluídos; suite completa com PostgreSQL 16 e LocalStack 3.8: 26 testes aprovados, 1 teste opcional ignorado e nenhuma falha.
+Validação desta revisão: instalação congelada em checkout temporário limpo com Bun 1.4.4; typecheck e build passaram; suíte completa contra PostgreSQL 16 e LocalStack 3.8: 30 testes aprovados, 1 teste opcional de fault injection ignorado (`EXPECT_ACK_FAULT=1`) e nenhuma falha.
 
 ## Operação e arquitetura
 
@@ -112,4 +114,6 @@ docker compose down
 
 O serviço atende `SIGTERM` e `SIGINT` com shutdown gracioso. Wallet, transação, ledger, Inbox e Outbox são persistidos atomicamente; o publisher publica os envelopes tipados após commit. Consulte [ARCHITECTURE.md](./ARCHITECTURE.md) para locks, idempotência, contratos de erro, eventos, métricas e trade-offs; veja [RETRY_DLQ_ARCHITECTURE.md](./RETRY_DLQ_ARCHITECTURE.md) para retries e DLQ.
 
-Limitações conhecidas: métricas são mantidas em memória e não há autenticação externa. Não registre valores ou payloads financeiros em logs.
+As migrations protegem a consistência wallet/ledger também no banco: uma constraint trigger diferida compara o saldo materializado à soma do ledger no commit. `ProviderIdentityPort` é o ponto de extensão para integrar um IdP OIDC no limite HTTP; autenticação não está ativa neste challenge. A proposta e os limites de confiança estão em [ARCHITECTURE.md](./ARCHITECTURE.md).
+
+Limitações conhecidas: métricas são mantidas em memória e não há autenticação externa. Eventos da Outbox podem ser publicados mais de uma vez; consumidores devem deduplicar persistentemente por `eventId`. Não registre valores ou payloads financeiros em logs.
