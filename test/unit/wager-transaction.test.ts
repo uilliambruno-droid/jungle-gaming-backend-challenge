@@ -12,6 +12,15 @@ describe("WagerTransaction",()=>{const money=Money.from({amount:"10.00",currency
   const win=WagerTransaction.rehydrate({...base,kind:WagerTransactionKind.Win,status:WagerTransactionStatus.Processed,createdAt:new Date(0)});
   expect(rollback.ledgerDirectionFor(win)).toBe(LedgerDirection.Debit);
  });
+ test("LOSS does not affect the balance and ROLLBACK reverses a WIN",()=>{
+  const loss=WagerTransaction.create({...base,kind:WagerTransactionKind.Loss});
+  expect(loss.affectsBalance()).toBe(false);
+
+  const win=WagerTransaction.rehydrate({...base,kind:WagerTransactionKind.Win,status:WagerTransactionStatus.Processed,createdAt:new Date(0)});
+  const rollback=WagerTransaction.create({...base,kind:WagerTransactionKind.Rollback,referenceExternalTransactionId:"win-external"});
+  expect(rollback.requiresReference()).toBe(true);
+  expect(rollback.ledgerDirectionFor(win)).toBe(LedgerDirection.Debit);
+ });
  test("does not expose mutable date references through state snapshots",()=>{
   const createdAt=new Date(0);
   const tx=WagerTransaction.rehydrate({...base,status:WagerTransactionStatus.Pending,createdAt});

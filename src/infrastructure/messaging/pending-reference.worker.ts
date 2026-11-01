@@ -289,29 +289,34 @@ export class PendingReferenceWorker implements OnModuleInit, OnModuleDestroy {
         createdAt: referenceRow.created_at,
         processedAt: referenceRow.processed_at ?? undefined,
       });
-      const valid = reference.providerId === row.provider_id
+      const sameContext = reference.providerId === row.provider_id
         && reference.playerId === row.player_id
         && reference.walletId === row.wallet_id
         && reference.roundId === row.round_id
         && reference.money.currency === amount.currency
-        && reference.money.equals(amount)
-        && reference.status === WagerTransactionStatus.Processed
-        && (transaction.kind === WagerTransactionKind.Refund
+        && reference.status === WagerTransactionStatus.Processed;
+      const valid = sameContext && (
+        transaction.kind === WagerTransactionKind.Win
           ? reference.kind === WagerTransactionKind.Bet
-          : [WagerTransactionKind.Bet, WagerTransactionKind.Win, WagerTransactionKind.Refund].includes(reference.kind));
+          : reference.money.equals(amount) && (transaction.kind === WagerTransactionKind.Refund
+            ? reference.kind === WagerTransactionKind.Bet
+            : [WagerTransactionKind.Bet, WagerTransactionKind.Win, WagerTransactionKind.Refund].includes(reference.kind))
+      );
       if (!valid) {
         await updateTerminal("INVALID_REFERENCE");
         return true;
       }
 
-      const priorReversals = await tm.execute<Array<{ id: string }>>(
-        `SELECT id FROM wager_transactions
-         WHERE reference_transaction_id=? AND kind=? AND status='PROCESSED'`,
-        [reference.id, transaction.kind],
-      );
-      if (priorReversals.length) {
-        await updateTerminal("DUPLICATE_REVERSAL");
-        return true;
+      if (transaction.requiresReference()) {
+        const priorReversals = await tm.execute<Array<{ id: string }>>(
+          `SELECT id FROM wager_transactions
+           WHERE reference_transaction_id=? AND kind=? AND status='PROCESSED'`,
+          [reference.id, transaction.kind],
+        );
+        if (priorReversals.length) {
+          await updateTerminal("DUPLICATE_REVERSAL");
+          return true;
+        }
       }
 
       const direction = transaction.ledgerDirectionFor(reference);

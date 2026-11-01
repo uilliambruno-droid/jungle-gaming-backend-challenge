@@ -62,11 +62,14 @@ integration("Inbox + SQS redelivery", () => {
     const queue = await sqs.send(new GetQueueUrlCommand({ QueueName: process.env.OUTBOX_QUEUE_NAME ?? "wager-events.fifo" }));
     expect(queue.QueueUrl).toBeTruthy();
     let found: Record<string, unknown> | undefined;
-    for (let attempt = 0; attempt < 20 && !found; attempt++) {
+    for (let attempt = 0; attempt < 25 && !found; attempt++) {
       const received = await sqs.send(new ReceiveMessageCommand({ QueueUrl: queue.QueueUrl, MaxNumberOfMessages: 10, WaitTimeSeconds: 1, VisibilityTimeout: 1 }));
       for (const message of received.Messages ?? []) {
         const envelope = JSON.parse(message.Body ?? "{}");
         if ((envelope.data as Record<string, unknown> | undefined)?.transactionId === result.transactionId) found = envelope;
+        if (message.ReceiptHandle) {
+          await sqs.send(new DeleteMessageCommand({ QueueUrl: queue.QueueUrl, ReceiptHandle: message.ReceiptHandle }));
+        }
       }
     }
     expect(found).toMatchObject({ eventId: expect.any(String), aggregateId: wallet.id, correlationId, version: 1 });
@@ -104,14 +107,28 @@ integration("Inbox + SQS redelivery", () => {
   }, 30000);
 
   test("replaying the same event id after a publish/update crash is broker-safe", async () => {
-    const queue = await sqs.send(new GetQueueUrlCommand({ QueueName: process.env.OUTBOX_QUEUE_NAME ?? "wager-events.fifo" }));
-    const eventId = `integration-crash-replay-${Date.now()}`;
-    const body = JSON.stringify({ eventId, eventType: "TestEvent", aggregateId: "integration-crash", correlationId: eventId, occurredAt: new Date().toISOString(), version: 1, data: { eventId } });
-    for (let attempt = 0; attempt < 2; attempt++) await sqs.send(new SendMessageCommand({ QueueUrl: queue.QueueUrl, MessageBody: body, MessageGroupId: "integration-crash", MessageDeduplicationId: eventId }));
-    const received = await sqs.send(new ReceiveMessageCommand({ QueueUrl: queue.QueueUrl, MaxNumberOfMessages: 10, WaitTimeSeconds: 2, VisibilityTimeout: 30 }));
-    const matching = (received.Messages ?? []).filter(message => JSON.parse(message.Body ?? "{}").eventId === eventId);
-    expect(matching).toHaveLength(1);
-    for (const message of matching) if (message.ReceiptHandle) await sqs.send(new DeleteMessageCommand({ QueueUrl: queue.QueueUrl, ReceiptHandle: message.ReceiptHandle }));
+    const queueName = `integration-event-dedup-${Date.now()}.fifo`;
+    const queue = await sqs.send(new CreateQueueCommand({
+      QueueName: queueName,
+      Attributes: { FifoQueue: "true", ContentBasedDeduplication: "false" },
+    }));
+    expect(queue.QueueUrl).toBeTruthy();
+    try {
+      const eventId = `integration-crash-replay-${Date.now()}`;
+      const body = JSON.stringify({ eventId, eventType: "TestEvent", aggregateId: "integration-crash", correlationId: eventId, occurredAt: new Date().toISOString(), version: 1, data: { eventId } });
+      for (let attempt = 0; attempt < 2; attempt++) await sqs.send(new SendMessageCommand({ QueueUrl: queue.QueueUrl, MessageBody: body, MessageGroupId: "integration-crash", MessageDeduplicationId: eventId }));
+      let matchingCount = 0;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const received = await sqs.send(new ReceiveMessageCommand({ QueueUrl: queue.QueueUrl, MaxNumberOfMessages: 10, WaitTimeSeconds: 1, VisibilityTimeout: 30 }));
+        for (const message of received.Messages ?? []) {
+          if (JSON.parse(message.Body ?? "{}").eventId === eventId) matchingCount++;
+          if (message.ReceiptHandle) await sqs.send(new DeleteMessageCommand({ QueueUrl: queue.QueueUrl, ReceiptHandle: message.ReceiptHandle }));
+        }
+      }
+      expect(matchingCount).toBe(1);
+    } finally {
+      await sqs.send(new DeleteQueueCommand({ QueueUrl: queue.QueueUrl }));
+    }
   }, 15000);
 
   test("pending references are retried after the referenced transaction arrives", async () => {

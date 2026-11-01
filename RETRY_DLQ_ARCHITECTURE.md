@@ -15,7 +15,8 @@ Enquanto a referência não aparece, `reference_attempts` e `reference_next_atte
 
 ## Classificação de falhas
 
-- Erros permanentes de validação, conflito e envelope inválido: o consumidor reconhece a mensagem e registra rejeição.
+- Conflitos (`409`) e rejeições de negócio (`422`): o consumidor reconhece a mensagem e registra o conflito; não há retry.
+- Envelope malformado ou payload que falha validação (`400`): o consumidor não apaga a mensagem; ela volta após expirar a visibilidade e segue a redrive policy até a DLQ.
 - Falhas de infraestrutura: o consumidor não faz delete; a visibilidade expira e o SQS redelivera.
 - Depois de `SQS_MAX_RECEIVE_COUNT`, a fila principal encaminha a mensagem para `wager-transactions-dlq.fifo`.
 

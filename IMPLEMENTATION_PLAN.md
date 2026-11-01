@@ -100,7 +100,7 @@ Estimativa técnica, não nota oficial:
 - [x] Marcados explicitamente como históricos os resultados anteriores de 26 e 30 testes para não confundi-los com a validação atual.
 - [x] Documentada a execução isolada da fault injection em dois terminais; usar filtro de nome evita que a falha única atinja outra mensagem primeiro.
 
-### Validação atual observada — 01/11/2026
+### Validação da revisão documental anterior — 01/11/2026
 
 Ambiente local: Bun 1.4.4, Docker Compose com PostgreSQL 16 e LocalStack 3.8 saudáveis.
 
@@ -111,7 +111,43 @@ Ambiente local: Bun 1.4.4, Docker Compose com PostgreSQL 16 e LocalStack 3.8 sau
 | `bun run typecheck` | Sucesso. |
 | `bun run build` | Sucesso. |
 | `bun test` | Sucesso: 11 testes passaram, 22 testes de integração foram ignorados porque `RUN_INTEGRATION` não estava habilitado. |
-| `$env:RUN_INTEGRATION="1"; bun test` | Sucesso: 30 passaram, 1 teste opcional de fault injection foi ignorado, 0 falharam. |
-| Teste filtrado commit-before-ack com `EXPECT_ACK_FAULT=1` e API iniciada com `SQS_TEST_FAIL_AFTER_COMMIT_BEFORE_ACK=1`, `SQS_VISIBILITY_TIMEOUT_SECONDS=2` | Sucesso: 1 passou, 8 filtrados, 0 falharam. |
+| `$env:RUN_INTEGRATION="1"; bun test` | Histórico da revisão documental: 30 passaram, 1 teste opcional de fault injection foi ignorado, 0 falharam. |
+| Teste filtrado commit-before-ack com `EXPECT_ACK_FAULT=1` e API iniciada com `SQS_TEST_FAIL_AFTER_COMMIT_BEFORE_ACK=1`, `SQS_VISIBILITY_TIMEOUT_SECONDS=2` | Histórico da revisão documental: 1 passou, 8 filtrados, 0 falharam. |
 
 O teste opcional foi executado isoladamente depois da suíte completa, reiniciando a API com a fault injection habilitada, para garantir que a falha de uso único atingisse a mensagem do cenário. Instruções reproduzíveis em `RETRY_DLQ_ARCHITECTURE.md`.
+
+## 9. WIN referenciado e cobertura das operações — concluído
+
+- [x] `WIN` continua aceito sem referência; quando `referenceExternalTransactionId` é informado, deve resolver para uma `BET` processada da mesma provider/player/wallet/moeda/rodada. O valor do `WIN` pode diferir do valor da aposta.
+- [x] Referência de `WIN` ainda ausente é persistida em `PENDING_REFERENCE`; o worker valida e processa o caso depois que a `BET` chega. Referências inválidas são rejeitadas com `INVALID_REFERENCE`.
+- [x] Testes de integração cobrem `WIN` referenciado direto e pendente, rejeição de referência a `LOSS`, `LOSS` sem lançamento de ledger e `ROLLBACK` processado de um `WIN`.
+- [x] Teste unitário cobre a regra de `LOSS` sem efeito no saldo e a direção de débito ao reverter um `WIN`.
+- [x] A abertura positiva da wallet gera `WagerTransactionProcessed` e `WalletBalanceChanged` atomicamente na Outbox; integração valida o envelope e os valores do crédito inicial.
+- [x] Documentada a distinção do consumidor entre rejeição/conflito reconhecidos e envelope inválido que segue para DLQ; README explicita que o replay preserva status HTTP e saldo originais.
+
+Validação anterior a esta correção: `bun run typecheck`, `bun run build`, 12 testes unitários, suíte PostgreSQL/LocalStack com 33 aprovados e 1 teste opcional ignorado; fault injection isolada commit-before-ack passou (1 teste). Nenhuma falha.
+
+### Validação final após alinhamento de abertura e DLQ — 01/11/2026
+
+| Comando | Resultado |
+|---|---|
+| `bun run typecheck` | Passou. |
+| `bun run build` | Passou. |
+| `bun test` | 12 passaram, 24 integrações ignoradas por ausência de `RUN_INTEGRATION`, 0 falhas. |
+| `$env:RUN_INTEGRATION="1"; bun test` | 33 passaram, 1 teste opcional de fault injection ignorado, 0 falhas; PostgreSQL 16 e LocalStack 3.8 ativos. |
+| Fault injection isolada com `EXPECT_ACK_FAULT=1`, `SQS_TEST_FAIL_AFTER_COMMIT_BEFORE_ACK=1` e `SQS_VISIBILITY_TIMEOUT_SECONDS=2` | 1 passou, 8 filtrados, 0 falhas. |
+| `git diff --check` | Sem erros de whitespace. |
+
+A integração também confirmou os envelopes `WagerTransactionProcessed` e `WalletBalanceChanged` da abertura positiva na Outbox. A migration mais recente e as filas SQS já estavam aplicadas/verificadas no ambiente local.
+
+## 10. Fechamento para entrega — 01/11/2026
+
+- [x] Adicionado ao `ARCHITECTURE.md` um diagrama Mermaid cobrindo entrada HTTP/SQS, idempotência, locks e domínio, persistência atômica, referências pendentes, Outbox, redelivery e DLQ.
+- [x] Reavaliados os critérios do tópico 14 do challenge: estimativa técnica de **94/100**, sem falha eliminatória identificada. A nota não é oficial; os descontos considerados são contenção de hot wallet, autenticação OIDC não implementada (opcional no challenge), métricas locais/aproximadas e variabilidade no startup de instâncias auxiliares durante testes sob carga.
+- [x] Repetidos typecheck, build, testes unitários, migrations e configuração SQS; todos passaram.
+- [x] Suíte completa final com PostgreSQL 16 e LocalStack 3.8: **33 passaram, 1 teste opcional de fault injection ignorado e 0 falhas**.
+- [x] Teste de fault injection commit-before-ack executado isoladamente com as variáveis documentadas: **1 passou, 8 filtrados e 0 falhas**.
+- [x] Uma tentativa anterior da suíte completa teve falhas de readiness em três processos auxiliares após execução prolongada; os três testes passaram isoladamente, e a execução completa subsequente terminou sem falhas. Registrar essa ocorrência como instabilidade transitória do ambiente, não ocultá-la.
+- [x] `.env` confirmado fora do Git e `git diff --check` sem erros.
+
+Comandos finais executados: `bun run typecheck`, `bun run build`, `bun test`, `bun run db:migrate`, `bun run sqs:setup`, `$env:RUN_INTEGRATION="1"; bun test`, o teste isolado descrito em `RETRY_DLQ_ARCHITECTURE.md` e `git diff --check`.

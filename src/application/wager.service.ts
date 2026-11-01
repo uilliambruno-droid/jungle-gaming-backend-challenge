@@ -245,6 +245,23 @@ export class WagerService {
             entry.balanceBefore.toJSON().amount, entry.balanceAfter.toJSON().amount, entry.createdAt,
           ],
         );
+        const openingContext = { correlationId: opening.id };
+        const events: IntegrationEvent<unknown>[] = [
+          WagerTransactionProcessed.create(wallet.id, openingContext, {
+            transactionId: opening.id,
+            walletId: wallet.id,
+            providerId: opening.providerId,
+            status: WagerTransactionStatus.Processed,
+          }, now),
+          WalletBalanceChanged.from(wallet, entry, openingContext, opening.providerId),
+        ];
+        for (const event of events) {
+          await tm.execute(
+            "INSERT INTO outbox_messages(id,aggregate_id,event_type,payload,occurred_at) VALUES(?,?,?,?,?)",
+            [event.eventId, event.aggregateId, event.eventType, JSON.stringify(event.toJSON()), event.occurredAt],
+          );
+        }
+        this.metrics.increment("transactions_processed_total");
       });
     } catch (error) {
       const details = postgresErrorDetails(error);
@@ -476,7 +493,9 @@ export class WagerService {
         }
 
         let reference: WagerTransaction | undefined;
-        if (transaction.requiresReference()) {
+        const hasOptionalWinReference = transaction.kind === WagerTransactionKind.Win
+          && Boolean(transaction.referenceExternalTransactionId);
+        if (transaction.requiresReference() || hasOptionalWinReference) {
           const references = await tm.execute<ReferenceRow[]>(
             `SELECT id,provider_id,external_transaction_id,idempotency_key,payload_hash,wallet_id,player_id,round_id,
                     game_id,kind,amount,currency,reference_external_transaction_id,reference_transaction_id,status,
@@ -510,28 +529,33 @@ export class WagerService {
             createdAt: row.created_at,
             processedAt: row.processed_at ?? undefined,
           });
-          const valid = row.player_id === input.playerId
+          const sameContext = row.player_id === input.playerId
             && row.wallet_id === input.walletId
             && row.round_id === input.roundId
             && row.currency.trim() === money.currency
-            && reference.money.equals(money)
-            && reference.status === WagerTransactionStatus.Processed
-            && (input.kind === WagerTransactionKind.Refund
+            && reference.status === WagerTransactionStatus.Processed;
+          const valid = sameContext && (
+            input.kind === WagerTransactionKind.Win
               ? reference.kind === WagerTransactionKind.Bet
-              : [WagerTransactionKind.Bet, WagerTransactionKind.Win, WagerTransactionKind.Refund].includes(reference.kind));
+              : reference.money.equals(money) && (input.kind === WagerTransactionKind.Refund
+                ? reference.kind === WagerTransactionKind.Bet
+                : [WagerTransactionKind.Bet, WagerTransactionKind.Win, WagerTransactionKind.Refund].includes(reference.kind))
+          );
           if (!valid) {
             transaction.reject("INVALID_REFERENCE");
             return finish(WagerTransactionStatus.Rejected, "INVALID_REFERENCE");
           }
 
-          const reversals = await tm.execute<Array<{ id: string }>>(
-            `SELECT id FROM wager_transactions
-             WHERE reference_transaction_id=? AND kind=? AND status='PROCESSED'`,
-            [reference.id, transaction.kind],
-          );
-          if (reversals.length) {
-            transaction.reject("DUPLICATE_REVERSAL");
-            return finish(WagerTransactionStatus.Rejected, "DUPLICATE_REVERSAL");
+          if (transaction.requiresReference()) {
+            const reversals = await tm.execute<Array<{ id: string }>>(
+              `SELECT id FROM wager_transactions
+               WHERE reference_transaction_id=? AND kind=? AND status='PROCESSED'`,
+              [reference.id, transaction.kind],
+            );
+            if (reversals.length) {
+              transaction.reject("DUPLICATE_REVERSAL");
+              return finish(WagerTransactionStatus.Rejected, "DUPLICATE_REVERSAL");
+            }
           }
         }
 

@@ -6,6 +6,50 @@ O serviço usa Bun, TypeScript strict, NestJS, MikroORM, PostgreSQL e SQS via Lo
 
 As escritas financeiras, Inbox e Outbox passam pelo `EntityManager` recebido em `EntityManager.transactional()` (`tm.execute`). Usar uma conexão fora do contexto transacional pode quebrar atomicidade, locks e consistência.
 
+### Fluxo visual
+
+```mermaid
+flowchart TD
+    Provider["Provedor / cliente"] -->|HTTP + Idempotency-Key| API["NestJS Controllers"]
+    Queue["SQS wager-transactions.fifo"] -->|poll / redelivery| Consumer["SqsConsumer"]
+    Consumer -->|mesmo caso de uso + Inbox| UseCase["WagerService.submit"]
+    API --> UseCase
+
+    UseCase --> Idempotency{"Idempotency-Key já existe?"}
+    Idempotency -->|Sim, hash igual| Replay["Reproduz status e saldo originais"]
+    Idempotency -->|Sim, hash diferente| Conflict["409: conflito"]
+    Replay --> API
+    Conflict --> API
+    Idempotency -->|Não| Tx["Transação PostgreSQL"]
+
+    Tx --> WalletLock["Lock da wallet"]
+    WalletLock --> Domain["Money + Wallet + WagerTransaction"]
+    Domain --> Reference{"Referência disponível e válida?"}
+    Reference -->|Ausente| Pending["PENDING_REFERENCE"]
+    Reference -->|Inválida| Rejected["REJECTED + failureCode"]
+    Reference -->|Válida / não exigida| Apply["Aplicar saldo e criar ledger"]
+
+    Pending --> AtomicPending["Persistir transação + Inbox + Outbox"]
+    Rejected --> AtomicRejected["Persistir rejeição + Inbox + Outbox"]
+    Apply --> AtomicProcessed["Persistir wallet + ledger + transação + Inbox + Outbox"]
+    AtomicPending --> Commit["COMMIT"]
+    AtomicRejected --> Commit
+    AtomicProcessed --> Commit
+
+    Commit --> Result["Resposta HTTP / ack SQS após commit"]
+    Result --> API
+    Result --> Consumer
+
+    AtomicPending -. "candidato pendente" .-> RefWorker["PendingReferenceWorker"]
+    RefWorker -->|wallet lock → reler/lock transação → validar| Tx
+    Commit --> OutboxWorker["OutboxPublisher"]
+    OutboxWorker -->|eventId como chave de deduplicação| EventQueue["SQS wager-events.fifo"]
+    Consumer -. "visibilidade expira em falha transitória" .-> Queue
+    Consumer -. "redrive após limite" .-> DLQ["SQS wager-transactions-dlq.fifo"]
+```
+
+O ramo de erro de infraestrutura aborta a transação sem confirmar efeitos financeiros; em SQS, a mensagem fica sem ack e pode ser redeliverada. O worker de referência usa a mesma ordem de locks do fluxo HTTP, e o publisher só lê/publica eventos que já foram confirmados na Outbox.
+
 ## Dinheiro, wallet e ledger
 
 `Money` mantém centavos em `bigint`; contratos e colunas PostgreSQL usam decimal com escala 2 (`numeric(30,2)`). Não há conversões monetárias para `number`. `Wallet.debit`/`credit` constroem `WalletLedgerEntry` balanceado, atualizam a versão e impedem saldo negativo.
@@ -21,6 +65,8 @@ Reconciliação lê saldo e ledger em uma única instrução SQL (um único snap
 ## Idempotência e respostas
 
 O `Idempotency-Key` HTTP é obrigatório. O SHA-256 de JSON canônico usa apenas campos de negócio, sem chave de idempotência nem metadados de transporte. A transação persiste status, saldo, moeda e código de falha originais da resposta; replay não consulta o saldo atual da wallet. Para operações que começam em `PENDING_REFERENCE`, isso significa que o replay sempre reproduz a resposta inicial (`202` e status pendente), mesmo se o worker posteriormente processar ou rejeitar a transação. O estado atual continua disponível em `GET /wagering/transactions/:id`; replay não é uma consulta de status atualizado.
+
+`WIN` pode ser enviado sem referência. Se `referenceExternalTransactionId` vier preenchido, a referência deve existir e apontar para uma `BET` processada da mesma provider/player/wallet/moeda/rodada; o valor do prêmio não precisa ser igual ao valor apostado. Enquanto a `BET` ainda não existir, o `WIN` fica `PENDING_REFERENCE` e o worker aplica a mesma validação depois que ela chegar.
 
 Inbox é única por `(consumer_name, message_id)`, compara o hash e guarda a transação associada. Inbox, transação, saldo, ledger e Outbox são confirmados juntos. O consumer apaga a mensagem somente após o commit; a redelivery depois de commit-before-ack retorna a transação associada sem repetir efeito. Hash divergente é conflito auditável.
 
@@ -40,13 +86,15 @@ Status HTTP:
 
 ## Inbox, SQS e Outbox
 
-O consumidor reaproveita o caso de uso HTTP. Conflitos terminais são auditados e reconhecidos; mensagens malformadas/permanentes não são apagadas e seguem a redrive policy para DLQ; falhas transitórias ficam sem ack e voltam após expirar a visibilidade. Em `SIGTERM`, a aplicação para de receber, espera o processamento atual e aguarda os workers terminarem; mensagens recebidas que ainda não começaram ficam elegíveis para redelivery.
+O consumidor reaproveita o caso de uso HTTP. Conflitos (`409`) e rejeições de negócio (`422`) são registrados e reconhecidos; envelope malformado ou payload inválido (`400`) não é apagado e segue a redrive policy para DLQ; falhas transitórias ficam sem ack e voltam após expirar a visibilidade. Em `SIGTERM`, a aplicação para de receber, espera o processamento atual e aguarda os workers terminarem; mensagens recebidas que ainda não começaram ficam elegíveis para redelivery.
 
 Cada evento de integração é uma classe concreta de `IntegrationEvent`, com `eventType`, versão e envelope persistido completo (`eventId`, `aggregateId`, `correlationId`, `causationId`, `occurredAt`, `version`, `data`). `correlationId`/`causationId` são propagados da requisição ou mensagem SQS. O evento não inclui instâncias de `Money`; valores financeiros são strings decimais.
 
 Os eventos de transação, alteração de saldo e referência pendente são gravados atomicamente com as alterações financeiras. `OutboxPublisher` usa `FOR UPDATE SKIP LOCKED`, publica o envelope persistido após o commit e marca `published_at`; `eventId` também é o `MessageDeduplicationId`. A janela entre publicação e atualização SQL pode duplicar publicação. SQS FIFO reduz duplicatas dentro de sua janela de deduplicação, mas não elimina a possibilidade de uma nova publicação após crash ou após essa janela; consumidores de eventos devem manter deduplicação persistente por `eventId` e tornar o handler idempotente.
 
-Referências fora de ordem ficam em `PENDING_REFERENCE`, com tentativas e backoff persistidos. O worker seleciona um candidato sem lock de transação, bloqueia a wallet primeiro, relê e bloqueia a transação pendente e revalida status/vencimento; depois bloqueia a referência e revalida as invariantes. Aplica a operação usando classes de domínio e persiste status, ledger e eventos atomicamente. Uma reversão duplicada é rejeitada também no worker.
+A abertura de uma wallet com saldo inicial positivo também é uma transação aplicada: `WagerTransactionProcessed` e `WalletBalanceChanged` são gravados na Outbox junto com a wallet, a transação `OPENING` e o lançamento inicial. A correlação desses eventos internos usa o ID da transação `OPENING`; wallet com saldo inicial zero não cria transação nem evento de abertura.
+
+Referências fora de ordem em `WIN`, `REFUND` e `ROLLBACK` ficam em `PENDING_REFERENCE`, com tentativas e backoff persistidos. O worker seleciona um candidato sem lock de transação, bloqueia a wallet primeiro, relê e bloqueia a transação pendente e revalida status/vencimento; depois bloqueia a referência e revalida as invariantes. Aplica a operação usando classes de domínio e persiste status, ledger e eventos atomicamente. Uma reversão duplicada é rejeitada também no worker.
 
 ## Observabilidade e ciclo de vida
 
@@ -62,7 +110,7 @@ As métricas são em memória para este challenge local. Os nomes `transactions_
 
 Setup, endpoints e comandos reproduzíveis estão no [README.md](./README.md). O desenho de retries e DLQ está em [RETRY_DLQ_ARCHITECTURE.md](./RETRY_DLQ_ARCHITECTURE.md).
 
-Validação mais recente (01/11/2026): Bun 1.4.4, PostgreSQL 16 e LocalStack 3.8; migrations/setup SQS, typecheck e build passaram. `bun test` passou com 11 testes unitários e 22 integrações ignoradas por falta de `RUN_INTEGRATION`. Com integração habilitada, a suíte completa passou com 30 aprovados, 1 fault injection ignorada e 0 falhas. Depois, o teste isolado commit-before-ack também passou (`1 pass, 8 filtered out, 0 fail`). Esta validação foi executada no worktree local; a execução anterior em clone limpo está registrada no plano.
+Validação mais recente (01/11/2026): Bun 1.4.4, PostgreSQL 16 e LocalStack 3.8; migrations/setup SQS, typecheck e build passaram. Os testes unitários passaram (12). Com integração habilitada, a suíte completa passou com 33 aprovados, 1 fault injection ignorada e 0 falhas. Depois, o teste isolado commit-before-ack também passou (`1 pass, 8 filtered out, 0 fail`). Esta validação foi executada no worktree local; inclui WIN referenciado direto/pendente, LOSS sem lançamento e ROLLBACK de WIN.
 
 ## Trade-offs e limitações
 

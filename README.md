@@ -33,7 +33,7 @@ Invoke-RestMethod http://localhost:3000/health/ready
 
 | Endpoint | Uso |
 |---|---|
-| `POST /wallets` | Cria wallet; saldo inicial positivo gera abertura no ledger |
+| `POST /wallets` | Cria wallet; saldo inicial positivo gera abertura no ledger e eventos na Outbox |
 | `GET /wallets/:id` | Consulta saldo e versão |
 | `GET /wallets/:id/ledger?limit=50&cursor=...` | Consulta ledger com cursor estável |
 | `POST /wallets/:id/reconciliation` | Compara saldo armazenado ao ledger, sem reparo silencioso |
@@ -63,8 +63,8 @@ Envie `Idempotency-Key: provider-a:transaction-123`. Opcionalmente, envie `X-Cor
 
 | HTTP | Significado |
 |---:|---|
-| `200` | Operação processada ou replay |
-| `202` | Aceita e aguardando referência |
+| `200` | Operação processada ou replay de resposta processada |
+| `202` | Aceita e aguardando referência; replay preserva esse status mesmo após o worker concluir |
 | `400` | Payload inválido ou `Idempotency-Key` ausente |
 | `404` | Wallet/transação inexistente |
 | `409` | Chave idempotente conflitante ou conflito estrutural de persistência |
@@ -73,7 +73,7 @@ Envie `Idempotency-Key: provider-a:transaction-123`. Opcionalmente, envie `X-Cor
 
 Uma reversão duplicada rejeitada pela regra de negócio retorna `422` com `failureCode: "DUPLICATE_REVERSAL"`.
 
-O replay sempre preserva a resposta da primeira submissão. Se a resposta inicial foi `202 PENDING_REFERENCE`, repeti-la continua retornando o mesmo `202` e o mesmo saldo original, ainda que o worker já tenha concluído a operação. Consulte `GET /wagering/transactions/:id` para conhecer o estado atual.
+O replay sempre preserva a resposta da primeira submissão, inclusive o status HTTP e o saldo original. Se a resposta inicial foi `202 PENDING_REFERENCE`, repeti-la continua retornando `202` e o mesmo saldo, ainda que o worker já tenha concluído a operação. Consulte `GET /wagering/transactions/:id` para conhecer o estado atual.
 
 ## Validação
 
@@ -94,7 +94,7 @@ bun test
 
 A suíte de concorrência também inicia múltiplas instâncias locais. Para exercitar o fault injection opcional de crash depois do commit e antes do ack, siga a execução isolada em dois terminais descrita em [RETRY_DLQ_ARCHITECTURE.md](./RETRY_DLQ_ARCHITECTURE.md). Rodar somente o teste específico garante que a falha única afete a mensagem correta.
 
-Validação mais recente (01/11/2026): com Bun 1.4.4, PostgreSQL 16 e LocalStack 3.8 ativos, migrations/setup SQS, `bun run typecheck`, `bun run build`, `bun test` (11 aprovados; 22 integrações ignoradas por ausência de `RUN_INTEGRATION`) e `$env:RUN_INTEGRATION="1"; bun test` (30 aprovados, 1 fault injection ignorada, 0 falhas) passaram. A fault injection também foi executada separadamente e passou: `1 pass, 8 filtered out, 0 fail`. Procedimento exato em [RETRY_DLQ_ARCHITECTURE.md](./RETRY_DLQ_ARCHITECTURE.md).
+Validação mais recente (01/11/2026): com Bun 1.4.4, PostgreSQL 16 e LocalStack 3.8 ativos, migrations/setup SQS, `bun run typecheck`, `bun run build` e 12 testes unitários passaram. A suíte completa `$env:RUN_INTEGRATION="1"; bun test` teve 33 aprovados, 1 fault injection ignorada e 0 falhas. A fault injection também foi executada separadamente e passou: `1 pass, 8 filtered out, 0 fail`. Procedimento exato em [RETRY_DLQ_ARCHITECTURE.md](./RETRY_DLQ_ARCHITECTURE.md).
 
 ## Operação e arquitetura
 

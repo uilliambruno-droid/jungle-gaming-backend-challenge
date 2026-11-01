@@ -253,6 +253,37 @@ integration("financial concurrency and persistence", () => {
       [wallet.id],
     );
     expect(ledger).toHaveLength(1);
+    const openingEvents = await query<{ event_type: string; payload: Record<string, unknown> }>(
+      `SELECT event_type,payload FROM outbox_messages
+       WHERE aggregate_id=? AND event_type IN ('WagerTransactionProcessed','WalletBalanceChanged')
+       ORDER BY event_type`,
+      [wallet.id],
+    );
+    expect(openingEvents.map(event => event.event_type)).toEqual([
+      "WagerTransactionProcessed",
+      "WalletBalanceChanged",
+    ]);
+    expect(openingEvents.map(event => event.payload)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        eventType: "WagerTransactionProcessed",
+        aggregateId: wallet.id,
+        correlationId: expect.any(String),
+        data: expect.objectContaining({ walletId: wallet.id, providerId: "__internal__", status: "PROCESSED" }),
+      }),
+      expect.objectContaining({
+        eventType: "WalletBalanceChanged",
+        aggregateId: wallet.id,
+        correlationId: expect.any(String),
+        data: expect.objectContaining({
+          walletId: wallet.id,
+          providerId: "__internal__",
+          direction: "CREDIT",
+          money: { amount: "100.00", currency: "BRL" },
+          balanceBefore: { amount: "0.00", currency: "BRL" },
+          balanceAfter: { amount: "100.00", currency: "BRL" },
+        }),
+      }),
+    ]));
 
     await orm.em.transactional(async transactionalEm => {
       const connection = transactionalEm.getConnection();
@@ -367,6 +398,164 @@ integration("financial concurrency and persistence", () => {
         balance: { amount: "100.00", currency: "BRL" },
       });
       await assertLedgerMatchesWallet(wallet.id, "90.00", instance.url);
+    } finally {
+      await stopInstance(instance);
+      await deleteQueue(queueUrl);
+    }
+  }, 45_000);
+
+  test("LOSS has no ledger entry and referenced WIN can be rolled back", async () => {
+    const wallet = await createWallet(apiUrl);
+    const suffix = crypto.randomUUID();
+    const betKey = `integration-win-reference-bet-${suffix}`;
+    const bet = await submitBet(apiUrl, wallet, "20.00", betKey);
+    expect(bet.status).toBe("PROCESSED");
+
+    const lossKey = `integration-win-reference-loss-${suffix}`;
+    const lossResponse = await fetch(`${apiUrl}/wagering/transactions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": lossKey },
+      body: JSON.stringify({
+        providerId: "integration-concurrency-provider",
+        externalTransactionId: `external-${lossKey}`,
+        playerId: wallet.playerId,
+        walletId: wallet.id,
+        roundId: "integration-concurrency-round",
+        gameId: "integration-concurrency-game",
+        kind: "LOSS",
+        money: { amount: "20.00", currency: "BRL" },
+      }),
+    });
+    expect(lossResponse.status).toBe(200);
+    expect(await lossResponse.json()).toMatchObject({
+      status: "PROCESSED",
+      balance: { amount: "80.00", currency: "BRL" },
+    });
+    const lossLedger = await query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM wallet_ledger_entries
+       WHERE transaction_id=(SELECT id FROM wager_transactions WHERE idempotency_key=?)`,
+      [lossKey],
+    );
+    expect(lossLedger[0].count).toBe("0");
+
+    const winKey = `integration-win-reference-win-${suffix}`;
+    const winResponse = await fetch(`${apiUrl}/wagering/transactions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": winKey },
+      body: JSON.stringify({
+        providerId: "integration-concurrency-provider",
+        externalTransactionId: `external-${winKey}`,
+        playerId: wallet.playerId,
+        walletId: wallet.id,
+        roundId: "integration-concurrency-round",
+        gameId: "integration-concurrency-game",
+        kind: "WIN",
+        referenceExternalTransactionId: `external-${betKey}`,
+        money: { amount: "30.00", currency: "BRL" },
+      }),
+    });
+    expect(winResponse.status).toBe(200);
+    const win = await winResponse.json() as WagerResponse;
+    expect(win).toMatchObject({ status: "PROCESSED", balance: { amount: "110.00", currency: "BRL" } });
+
+    const winReference = await query<{ reference_transaction_id: string; bet_id: string }>(
+      `SELECT w.reference_transaction_id, b.id AS bet_id
+       FROM wager_transactions w
+       JOIN wager_transactions b ON b.idempotency_key=?
+       WHERE w.idempotency_key=?`,
+      [betKey, winKey],
+    );
+    expect(winReference).toHaveLength(1);
+    expect(winReference[0].reference_transaction_id).toBe(winReference[0].bet_id);
+
+    const invalidWinKey = `integration-win-reference-invalid-${suffix}`;
+    const invalidWinResponse = await fetch(`${apiUrl}/wagering/transactions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": invalidWinKey },
+      body: JSON.stringify({
+        providerId: "integration-concurrency-provider",
+        externalTransactionId: `external-${invalidWinKey}`,
+        playerId: wallet.playerId,
+        walletId: wallet.id,
+        roundId: "integration-concurrency-round",
+        gameId: "integration-concurrency-game",
+        kind: "WIN",
+        referenceExternalTransactionId: `external-${lossKey}`,
+        money: { amount: "3.00", currency: "BRL" },
+      }),
+    });
+    expect(invalidWinResponse.status).toBe(422);
+    expect(await invalidWinResponse.json()).toMatchObject({
+      status: "REJECTED",
+      failureCode: "INVALID_REFERENCE",
+    });
+
+    const rollbackKey = `integration-win-reference-rollback-${suffix}`;
+    const rollbackResponse = await fetch(`${apiUrl}/wagering/transactions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": rollbackKey },
+      body: JSON.stringify({
+        providerId: "integration-concurrency-provider",
+        externalTransactionId: `external-${rollbackKey}`,
+        playerId: wallet.playerId,
+        walletId: wallet.id,
+        roundId: "integration-concurrency-round",
+        gameId: "integration-concurrency-game",
+        kind: "ROLLBACK",
+        referenceExternalTransactionId: `external-${winKey}`,
+        money: { amount: "30.00", currency: "BRL" },
+      }),
+    });
+    expect(rollbackResponse.status).toBe(200);
+    expect(await rollbackResponse.json()).toMatchObject({
+      status: "PROCESSED",
+      balance: { amount: "80.00", currency: "BRL" },
+    });
+    await assertLedgerMatchesWallet(wallet.id, "80.00");
+  }, 30_000);
+
+  test("WIN with a missing supplied reference waits and processes after its BET arrives", async () => {
+    const suffix = crypto.randomUUID();
+    const queueName = `integration-win-pending-reference-${suffix}.fifo`;
+    const queueUrl = await createQueue(queueName);
+    const instance = await startInstance(queueName, {
+      consumerName: `integration-win-pending-reference-${suffix}`,
+      pendingPollIntervalMs: 20,
+    });
+    try {
+      const wallet = await createWallet(instance.url);
+      const betKey = `integration-win-pending-bet-${suffix}`;
+      const winKey = `integration-win-pending-win-${suffix}`;
+      const winBody = {
+        providerId: "integration-concurrency-provider",
+        externalTransactionId: `external-${winKey}`,
+        playerId: wallet.playerId,
+        walletId: wallet.id,
+        roundId: "integration-concurrency-round",
+        gameId: "integration-concurrency-game",
+        kind: "WIN",
+        referenceExternalTransactionId: `external-${betKey}`,
+        money: { amount: "30.00", currency: "BRL" },
+      };
+
+      const pendingResponse = await fetch(`${instance.url}/wagering/transactions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "idempotency-key": winKey },
+        body: JSON.stringify(winBody),
+      });
+      expect(pendingResponse.status).toBe(202);
+      expect(await pendingResponse.json()).toMatchObject({ status: "PENDING_REFERENCE" });
+
+      const bet = await submitBet(instance.url, wallet, "20.00", betKey);
+      expect(bet.status).toBe("PROCESSED");
+      await waitUntil(async () => {
+        const rows = await query<{ status: string; reference_transaction_id: string | null }>(
+          `SELECT status,reference_transaction_id FROM wager_transactions WHERE idempotency_key=?`,
+          [winKey],
+        );
+        return rows[0]?.status === "PROCESSED" && rows[0]?.reference_transaction_id === bet.transactionId;
+      }, 20_000, "PENDING_WIN_REFERENCE_WAS_NOT_PROCESSED");
+      await assertLedgerMatchesWallet(wallet.id, "110.00", instance.url);
     } finally {
       await stopInstance(instance);
       await deleteQueue(queueUrl);
