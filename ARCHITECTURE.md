@@ -1,50 +1,73 @@
 # Decisões de arquitetura
 
-## Visão geral
+## Limites e fluxo
 
-O sistema usa Bun, NestJS, TypeScript strict, PostgreSQL, MikroORM, Docker Compose e SQS via LocalStack. O domínio não conhece NestJS, MikroORM ou SQS.
+O serviço usa Bun, TypeScript strict, NestJS, MikroORM, PostgreSQL e SQS via LocalStack. Controllers e workers chamam o mesmo caso de uso (`WagerService.submit`); as classes de domínio (`Money`, `Wallet`, `WagerTransaction` e `WalletLedgerEntry`) validam representação monetária e transições antes da persistência. O domínio não depende de NestJS, MikroORM ou SQS.
+
+As escritas financeiras, Inbox e Outbox passam pelo `EntityManager` recebido em `EntityManager.transactional()` (`tm.execute`). Usar uma conexão fora do contexto transacional pode quebrar atomicidade, locks e consistência.
 
 ## Dinheiro, wallet e ledger
 
-`Money` usa `bigint` em centavos e serializa valores como strings com duas casas. Cada alteração de saldo bloqueia a wallet com `SELECT ... FOR UPDATE`, valida saldo e moeda, atualiza saldo/version e grava um lançamento imutável no ledger na mesma transação PostgreSQL.
+`Money` mantém centavos em `bigint`; contratos e colunas PostgreSQL usam decimal com escala 2 (`numeric(30,2)`). Não há conversões monetárias para `number`. `Wallet.debit`/`credit` constroem `WalletLedgerEntry` balanceado, atualizam a versão e impedem saldo negativo.
 
-O endpoint de ledger consulta o PostgreSQL usando cursor opaco e ordenação estável por `(created_at, id)`. É somente leitura.
+`SELECT ... FOR UPDATE` na wallet é o ponto de serialização por `walletId`. O fluxo HTTP bloqueia a wallet antes da transação de referência; o worker de referência bloqueia a transação pendente antes da wallet. Essa ordem não é idêntica: uma operação concorrente que referencie a transação pendente pode provocar deadlock. O PostgreSQL aborta uma das transações, o conflito é contabilizado e a chamada HTTP recebe `503`, podendo ser reenviada com a mesma chave idempotente. É uma oportunidade de melhoria antes de operar com carga alta. A consulta de reversões ocorre sob o lock da wallet e uma unique partial index em `(reference_transaction_id, kind)` para reversões processadas é a última proteção do banco.
 
-## Inbox e idempotência
+Uma reversão duplicada observada pelo fluxo normal é uma rejeição auditável (`422`, `DUPLICATE_REVERSAL`); `409` fica reservado para conflito de idempotência ou colisão estrutural inesperada.
 
-Mensagens SQS são registradas em `inbox_messages` por `(consumer_name, message_id)`. O hash do payload detecta conflitos. O ack só acontece depois do commit SQL. Falhas antes do commit são revertidas; falhas depois do commit permitem redelivery sem novo efeito financeiro.
+Constraints PostgreSQL cobrem wallet não negativa e única por player/moeda, transação externa e chave idempotente únicas, ledger balanceado/imutável e no máximo uma reversão processada por tipo e referência. Migrations têm `up` e `down`; a migration 003 registra o snapshot de resposta e contexto de correlação.
 
-Erros permanentes de envelope, conflito ou validação fazem ack e rejeição. Falhas de infraestrutura não fazem delete e permanecem elegíveis para redelivery.
+Reconciliação lê saldo e ledger em uma única instrução SQL (um único snapshot MVCC), calcula `stored - calculated` usando `Money` e não corrige divergências. O endpoint sinaliza `consistent`, diferença e quantidade de entradas; divergências incrementam métrica.
 
-## Outbox e publishers
+## Idempotência e respostas
 
-Wallet, transação, ledger, Inbox e Outbox participam da mesma transação financeira. O `OutboxPublisher` usa `FOR UPDATE SKIP LOCKED`, permitindo múltiplas instâncias concorrentes.
+O `Idempotency-Key` HTTP é obrigatório. O SHA-256 de JSON canônico usa apenas campos de negócio, sem chave de idempotência nem metadados de transporte. A transação persiste status, saldo, moeda e código de falha originais da resposta; replay não consulta o saldo atual da wallet.
 
-Eventos são publicados na fila `wager-events.fifo` com envelope versionado. O ID persistido da Outbox é usado como `eventId` e `MessageDeduplicationId`. Falhas incrementam `attempts` e calculam `next_attempt_at` com backoff exponencial.
+Inbox é única por `(consumer_name, message_id)`, compara o hash e guarda a transação associada. Inbox, transação, saldo, ledger e Outbox são confirmados juntos. O consumer apaga a mensagem somente após o commit; a redelivery depois de commit-before-ack retorna a transação associada sem repetir efeito. Hash divergente é conflito auditável.
 
-## Retries, DLQ e referências fora de ordem
+O tratamento de `23505` é explícito e limitado: colisão de chave idempotente consulta a transação já confirmada uma vez e retorna replay ou conflito; outros índices únicos viram conflito de persistência/reversão. Não há retry recursivo.
 
-`PENDING_REFERENCE` representa uma transação recebida antes da referência. O `PendingReferenceWorker` usa `FOR UPDATE SKIP LOCKED` e persiste `reference_attempts` e `reference_next_attempt_at`.
+Status HTTP:
 
-Quando a referência aparece, o worker valida provider, player, wallet, rodada, moeda, valor e tipo. Wallet, ledger, status e eventos da Outbox são atualizados atomicamente. Após o limite, a transação é rejeitada com `REFERENCE_NOT_FOUND`.
+| Resultado | HTTP |
+|---|---:|
+| Transação processada/replay processado | `200` |
+| Referência ainda ausente | `202` |
+| Rejeição de regra de negócio | `422` |
+| Conflito de idempotência ou conflito estrutural de persistência | `409` |
+| Payload inválido ou chave ausente | `400` |
+| Recurso inexistente | `404` |
+| Falha transitória de infraestrutura | `503` |
 
-A fila `wager-transactions.fifo` possui redrive policy para `wager-transactions-dlq.fifo`, configurada por `bun run sqs:setup`.
+## Inbox, SQS e Outbox
 
-## Readiness e observabilidade
+O consumidor reaproveita o caso de uso HTTP. Conflitos terminais são auditados e reconhecidos; mensagens malformadas/permanentes não são apagadas e seguem a redrive policy para DLQ; falhas transitórias ficam sem ack e voltam após expirar a visibilidade. Em `SIGTERM`, a aplicação para de receber, espera o processamento atual e aguarda os workers terminarem; mensagens recebidas que ainda não começaram ficam elegíveis para redelivery.
 
-- `/health/live` verifica se o processo está ativo.
-- `/health/ready` verifica PostgreSQL e SQS e retorna `503` quando uma dependência falha.
-- `/health/metrics` expõe contadores operacionais.
+Cada evento de integração é uma classe concreta de `IntegrationEvent`, com `eventType`, versão e envelope persistido completo (`eventId`, `aggregateId`, `correlationId`, `causationId`, `occurredAt`, `version`, `data`). `correlationId`/`causationId` são propagados da requisição ou mensagem SQS. O evento não inclui instâncias de `Money`; valores financeiros são strings decimais.
 
-Os logs são JSON estruturados e não registram payloads financeiros completos. As métricas são mantidas em memória para desenvolvimento local; produção deve usar Prometheus, OpenTelemetry ou equivalente.
+Os eventos de transação, alteração de saldo e referência pendente são gravados atomicamente com as alterações financeiras. `OutboxPublisher` usa `FOR UPDATE SKIP LOCKED`, publica o envelope persistido após o commit e marca `published_at`; `eventId` também é o `MessageDeduplicationId`. A janela entre publicação e atualização SQL pode duplicar publicação, portanto o consumidor de eventos deve deduplicar por `eventId`.
 
-## Desenvolvimento local
+Referências fora de ordem ficam em `PENDING_REFERENCE`, com tentativas e backoff persistidos. O worker trava wallet e referência, revalida todas as invariantes, aplica a operação usando classes de domínio e persiste status, ledger e eventos atomicamente. Uma reversão duplicada é rejeitada também no worker.
 
-Use `docker compose up -d postgres localstack`, `bun run db:migrate`, `bun run sqs:setup` e `bun run dev`. Consulte [RETRY_DLQ_ARCHITECTURE.md](./RETRY_DLQ_ARCHITECTURE.md) para detalhes de retry e DLQ.
+## Observabilidade e ciclo de vida
 
-## Limitações antes da entrega
+- `/health/live` verifica liveness; `/health/ready` verifica PostgreSQL, fila principal e DLQ.
+- `/health/metrics` expõe contadores por status, duplicatas, retries, DLQ, conflitos de lock, latência e quantidade/atraso da Outbox.
+- Logs JSON incluem correlation/message/transaction/wallet/provider ids nos fluxos de processamento; não registram payloads nem valores financeiros.
+- `SIGTERM` e `SIGINT` acionam os hooks de shutdown do NestJS.
 
-- Ainda falta executar a suíte final com 50 mensagens idênticas e duas apostas concorrentes na mesma wallet.
-- A validação final deve ser repetida a partir de ambiente limpo.
-- As métricas não possuem armazenamento externo.
-- Autenticação externa não foi implementada porque não é pontuada no desafio.
+As métricas são em memória para este challenge local. Os nomes `transactions_*_total` contam transições/eventos de processamento, não um snapshot do número atual de linhas em cada status. A profundidade da DLQ só é atualizada durante readiness e é uma aproximação eventualmente consistente. Latência é exposta como contagem, soma e máximo; não há histogramas/percentis. Em produção, exportar para Prometheus/OpenTelemetry, usar histogramas e medir a DLQ por um coletor dedicado.
+
+## Desenvolvimento e validação
+
+Setup, endpoints e comandos reproduzíveis estão no [README.md](./README.md). O desenho de retries e DLQ está em [RETRY_DLQ_ARCHITECTURE.md](./RETRY_DLQ_ARCHITECTURE.md).
+
+Validação final: Bun 1.4.4, PostgreSQL 16 e LocalStack 3.8. A suite completa com dependências reais aprovou 26 testes; 1 fault-injection opcional foi ignorado por depender de `EXPECT_ACK_FAULT=1`. Inclui 50 redeliveries, duas e três instâncias, wallets distintas, reversões pendentes concorrentes, replay com snapshot, restart, Outbox concorrente, DLQ e reconciliação ledger/saldo, inclusive diferença assinada.
+
+## Trade-offs e limitações
+
+- Lock pessimista no banco é simples e correto para operações financeiras; operações em uma wallet hot são serializadas, enquanto wallets distintas avançam em paralelo.
+- A Outbox garante publicação eventual, não exactly-once na fronteira PostgreSQL/SQS. A deduplicação por `eventId` é responsabilidade do consumidor.
+- As métricas em memória reiniciam com o processo; a profundidade da DLQ e a contagem SQS são aproximadas.
+- O backfill de snapshots na migration 003 deriva respostas históricas do ledger disponível; para dados legados sem lançamento ou com timestamps ambíguos, o saldo exato da resposta original não pode ser recuperado. Operações novas persistem o snapshot exato no commit.
+- Autenticação externa não foi implementada por não ser pontuada no challenge; os endpoints de health permanecem abertos.
+- O teste de falha artificial após commit e antes do ack é opt-in com `EXPECT_ACK_FAULT=1`; o teste de reinício e redelivery da suíte normal não depende dele.

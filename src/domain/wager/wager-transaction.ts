@@ -1,4 +1,5 @@
 import { Money } from "../money/money.js";
+import { LedgerDirection } from "../ledger/wallet-ledger-entry.js";
 
 export enum WagerTransactionKind { Opening="OPENING", Bet="BET", Win="WIN", Loss="LOSS", Refund="REFUND", Rollback="ROLLBACK" }
 export enum WagerTransactionStatus { Pending="PENDING", PendingReference="PENDING_REFERENCE", Processed="PROCESSED", Rejected="REJECTED", Failed="FAILED" }
@@ -25,6 +26,14 @@ export class WagerTransaction {
   affectsBalance(){return this.kind !== WagerTransactionKind.Loss}
   requiresReference(){return this.kind === WagerTransactionKind.Refund || this.kind === WagerTransactionKind.Rollback}
   matchesPayload(hash:string){return this.payloadHash===hash}
+  ledgerDirectionFor(reference?: WagerTransaction): LedgerDirection {
+    if (this.kind === WagerTransactionKind.Bet) return LedgerDirection.Debit;
+    if (this.kind === WagerTransactionKind.Win || this.kind === WagerTransactionKind.Refund) return LedgerDirection.Credit;
+    if (this.kind === WagerTransactionKind.Rollback && reference) {
+      return reference.kind === WagerTransactionKind.Bet ? LedgerDirection.Credit : LedgerDirection.Debit;
+    }
+    throw new Error("INVALID_LEDGER_DIRECTION");
+  }
   markPendingReference(){this.assertOpen(); this.state.status=WagerTransactionStatus.PendingReference}
   markProcessed(referenceTransactionId:string|undefined, at:Date){this.assertOpen(); this.state.status=WagerTransactionStatus.Processed; this.state.referenceTransactionId=referenceTransactionId; this.state.processedAt=new Date(at)}
   reject(code:FailureCode){this.assertOpen(); this.state.status=WagerTransactionStatus.Rejected; this.state.failureCode=code}

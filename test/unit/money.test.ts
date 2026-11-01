@@ -17,4 +17,11 @@ describe("Money", () => {
     expect(() => Money.from({ amount: "1.00", currency: "BRL" })
       .add(Money.from({ amount: "1.00", currency: "USD" }))).toThrow("CURRENCY_MISMATCH");
   });
+  test("serializes a signed internal difference without accepting negative input", () => {
+    const difference = Money.from({ amount: "1.00", currency: "BRL" })
+      .subtract(Money.from({ amount: "2.50", currency: "BRL" }));
+    expect(difference.toJSON()).toEqual({ amount: "-1.50", currency: "BRL" });
+    expect(difference.isNegative()).toBe(true);
+    expect(() => Money.from(difference.toJSON())).toThrow("INVALID_AMOUNT");
+  });
 });

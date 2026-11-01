@@ -55,7 +55,8 @@ integration("Inbox + SQS redelivery", () => {
     expect(walletResponse.ok).toBe(true);
     const wallet = await walletResponse.json() as { id: string };
     const transactionId = `integration-outbox-bet-${Date.now()}`;
-    const response = await fetch(`${apiUrl}/wagering/transactions`, { method: "POST", headers: { "content-type": "application/json", "idempotency-key": `integration-outbox-key-${Date.now()}` }, body: JSON.stringify({ providerId: "integration-outbox-provider", externalTransactionId: transactionId, playerId, walletId: wallet.id, roundId: "integration-outbox-round", gameId: "integration-outbox-game", kind: "BET", money: { amount: "10.00", currency: "BRL" } }) });
+    const correlationId = `integration-outbox-correlation-${Date.now()}`;
+    const response = await fetch(`${apiUrl}/wagering/transactions`, { method: "POST", headers: { "content-type": "application/json", "idempotency-key": `integration-outbox-key-${Date.now()}`, "x-correlation-id": correlationId }, body: JSON.stringify({ providerId: "integration-outbox-provider", externalTransactionId: transactionId, playerId, walletId: wallet.id, roundId: "integration-outbox-round", gameId: "integration-outbox-game", kind: "BET", money: { amount: "10.00", currency: "BRL" } }) });
     expect(response.ok).toBe(true);
     const result = await response.json() as { transactionId: string };
     const queue = await sqs.send(new GetQueueUrlCommand({ QueueName: process.env.OUTBOX_QUEUE_NAME ?? "wager-events.fifo" }));
@@ -68,7 +69,7 @@ integration("Inbox + SQS redelivery", () => {
         if ((envelope.data as Record<string, unknown> | undefined)?.transactionId === result.transactionId) found = envelope;
       }
     }
-    expect(found).toMatchObject({ eventId: expect.any(String), aggregateId: wallet.id, correlationId: result.transactionId, version: 1 });
+    expect(found).toMatchObject({ eventId: expect.any(String), aggregateId: wallet.id, correlationId, version: 1 });
     expect(["WagerTransactionProcessed", "WalletBalanceChanged"]).toContain(String(found?.eventType));
     expect(found?.data).toMatchObject({ transactionId: result.transactionId, walletId: wallet.id });
   }, 30000);
